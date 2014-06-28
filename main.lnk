@@ -1,0 +1,9 @@
+SECTIONS
+{
+  . = 0;
+  .text : { *(.text) }
+  . = 0x10000000;
+  .data : { *(.data) }
+  .bss : { *(.bss) }
+}
+

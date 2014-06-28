@@ -1,0 +1,13 @@
+To build the code you will need the ARM cross-compiler and tools: under
+Debian, packages gcc-arm-linux-gnueabi and binutils-arm-linux-gnueabi.
+
+The Python program ctrl.py provides a simple user interface for adjusting
+the parameters of the patches on MIDI channels 2 to 16. (The patch on
+MIDI channel 1 is always controlled from Goom's front panel.) You will
+need the Python portmidi library and the Python Gtk developer library:
+under Debian, packages python-pypm and python-gtk2. Run the program from
+the command line.
+
+Mark Owen
+goom@quinapalus.com
+June 2014
