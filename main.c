@@ -54,7 +54,7 @@ const unsigned short exptab0[64]={ // "top octave generator": round(2^15*(2.^([0
   46341,46846,47356,47871,48393,48920,49452,49991,50535,51085,51642,52204,52773,53347,53928,54515,
   55109,55709,56316,56929,57549,58176,58809,59449,60097,60751,61413,62081,62757,63441,64132,64830};
 
-const unsigned short exptab1[64]={ // fine tuning: round(2^15*(2.^([0:1:31]/1024)))
+const unsigned short exptab1[64]={ // fine tuning: round(2^15*(2.^([0:1:63]/64/64)))
   32768,32774,32779,32785,32790,32796,32801,32807,32812,32818,32823,32829,32835,32840,32846,32851,
   32857,32862,32868,32874,32879,32885,32890,32896,32901,32907,32912,32918,32924,32929,32935,32940,
   32946,32952,32957,32963,32968,32974,32979,32985,32991,32996,33002,33007,33013,33018,33024,33030,
@@ -118,7 +118,7 @@ struct patchdata {
   unsigned char cut;               // 10    filter cutoff
   signed char fega;                // 11    filter sensitivity
   unsigned char res;               // 12    filter resonance
-  unsigned char omode;             // 13    oscilaator mode: 0=mix 1=FM 2=FM+FB
+  unsigned char omode;             // 13    oscillator mode: 0=mix 1=FM 2=FM+FB
   struct egparams egp[2];          // 14,22 parameters for amplitude and filter envelope generators
   } patch[NCHAN];
 
@@ -336,7 +336,7 @@ void procctrl(int chan) {
   for(i=0;i<NPOLY;i++) if(vcs[i].chan==chan) setfreqvol(vcs+i,ct); // update any affected voices
   }
 
-void memset(void*p,int c,int n) { for(;n>0;n--) *((unsigned char*)p++)=c; }
+void memset(volatile void*p,int c,int n) { for(;n>0;n--) *((unsigned char*)p++)=c; }
 
 
 // system initialisation
@@ -432,9 +432,9 @@ void setbaud(int x) {
   }
 
 // output one byte
-void o1ch(char c) { while(!(UART_LSR&0x20)) ; UART_THR=c; }
+void o1ch(char c) { while(!(UART_LSR&0x20)) {} UART_THR=c; }
 
-char rxbuf[256];              // buffer for received bytes
+char rxbuf[256];           // buffer for received bytes
 unsigned char rxbp0,rxbp1; // indices into rxbuf
 
 // wait for one byte, updating controller information in any spare time
@@ -449,7 +449,7 @@ char w1ch() {
         c=UART_RBR;
         if(c<0xf8) rxbuf[rxbp1++]=c;   // empty receive FIFO into local buffer, skipping all realtime messages
         }
-      if(rxbp0!=rxbp1) return rxbuf[rxbp0++];        // if there are any characters in our buffer, return immediately
+      if(rxbp0!=rxbp1) return rxbuf[rxbp0++];    // if there are any characters in our buffer, return immediately
       if(kn[i]<(ct[i]<<9)+ 0x40) ct[i]=kn[i]>>9; // update knob positions if any have moved by more than a small amount
       if(kn[i]>(ct[i]<<9)+0x380) ct[i]=kn[i]>>9;
       }
@@ -517,7 +517,8 @@ l2:
   ch=b0&0x0f;        // channel number
   switch(b0&0xf0) {  // message type
 case 0x80: // note off
-    b2=0; // set velocity to 0 and fall through
+    b2=0;  // set velocity to 0 and
+           // fall through
 case 0x90: // note on
     mu=-1; mi=0;
     for(i=0;i<NPOLY;i++) { // find a voice to use
@@ -591,4 +592,158 @@ sysex: // handle system exclusive messages
     o1ch(0xf7);
     }
   goto l0; // wait for new status
+  }
+
+#ifndef __SSAT
+inline int __SSAT(int x,unsigned n) { --n; return x>>n != x>>31 ? ((1<<n)-1) ^ x>>31 : x; }
+#endif
+
+// waveform generation code
+void wavupa() {
+#define QP 0x400000 // constant needed by oscillator kernel
+// oscillator kernel
+#define OKER(mod) ({ \
+  int i,pos,sinvd; \
+  unsigned t,mph; \
+  ph+=dph;                      /* accumulate phase */ \
+  mph=ph+(mod);                 /* add in frequency (actually phase) modulation */ \
+  mph>>=16;                     /* rescale */ \
+  pos=(per-mph)*k1;             /* compute position in sine given two possible slopes */ \
+  if(pos>=+QP) pos=mph*k0;      /* determine which slope is required */ \
+  if(pos<=-QP) pos=mph*k0-(k0<<16); \
+  t=(unsigned short)pos>>10;    /* extract fractional part needed for interpolation */ \
+  i=__SSAT(pos>>16,7);          /* clamp result to produce flat parts of waveform */ \
+  sinvd=((int*)sintab+64)[i];   /* fetch sine value and difference */ \
+  (short)sinvd+((sinvd*t)>>22); /* interpolated result */ \
+  })
+
+  int samp[4];                        // 4 samples on stack
+  struct voicedata*v;
+  memset(tbuf,0,sizeof(tbuf));        // clear output sample accumulator buffer
+  for(v=vcs;v<vcs+NPOLY;v++) {        // points to the voice data
+    struct patchdata*p=patch+v->chan; // get corresponding patch data for this voice
+    int o1o;
+    unsigned ph,dph,per,k0,k1,o1vol=v->o1vol;
+
+    // fetch oscillator 1 parameters
+    ph=v->o1ph,dph=v->o1dph,per=v->o1p,k0=v->o1k0,k1=v->o1k1;
+    // switch on oscillator combine mode
+    if(p->omode<2) { // omode=0,1 (mix, FM)
+      // plain oscillator
+      // compute 4 samples with output scaled by oscillator 1 level
+      samp[0]=OKER(0)*o1vol;
+      samp[1]=OKER(0)*o1vol;
+      samp[2]=OKER(0)*o1vol;
+      samp[3]=(o1o=OKER(0))*o1vol;
+    } else { // omode=2 (FM+FB)
+      // with FM feedback
+      // compute 4 samples with output scaled by oscillator 1 level
+      samp[0]=OKER(v->o1fb<<8)*o1vol; // get feedback value
+      samp[1]=OKER(samp[0]<<8)*o1vol;
+      samp[2]=OKER(samp[1]<<8)*o1vol;
+      samp[3]=v->o1fb=(o1o=OKER(samp[2]<<8))*o1vol; // store feedback value for next time
+      }
+    v->o1ph=ph;
+    if((v->o1o^o1o)<0) v->o1vol=v->o1egout; // update vol at zero-crossing of output
+    v->o1o=o1o;
+
+    // fetch oscillator 0 parameters
+    ph=v->o0ph,dph=v->o0dph,per=v->o0p,k0=v->o0k0,k1=v->o0k1;
+    if(p->omode<1) { // omode=0 (mix)
+      // plain oscillator
+      // generate 4 samples, summing results into output
+      samp[0]=OKER(0)+(samp[0]>>14);
+      samp[1]=OKER(0)+(samp[1]>>14);
+      samp[2]=OKER(0)+(samp[2]>>14);
+      samp[3]=OKER(0)+(samp[3]>>14);
+    } else { // omode=1,2 (FM, FM+FB)
+      // with FM
+      // generate 4 samples
+      samp[0]=OKER(samp[0]<<4);
+      samp[1]=OKER(samp[1]<<4);
+      samp[2]=OKER(samp[2]<<4);
+      samp[3]=OKER(samp[3]<<4);
+      }
+    v->o0ph=ph;
+
+// filter step using sample in x
+// simple CSound-style second order filter
+#define FILSTEP(x) \
+  lo+=(((fk*ba)>>8)*fk)>>8, \
+  ba+=(((((x)-((res*ba)>>8)-lo)*fk)>>8)*fk)>>8, \
+  (x)=__SSAT(lo,17)    /* clamp output */
+
+    // fetch filter parameters and state
+    int fk=v->fk,res=p->res,lo=v->lo,ba=v->ba;
+    FILSTEP(samp[0]);  // run filter over 4 samples
+    FILSTEP(samp[1]);
+    FILSTEP(samp[2]);
+    FILSTEP(samp[3]);
+    v->lo=lo,v->ba=ba; // save internal filter state
+
+    unsigned amp[2];   // overall left and right multipliers
+    int out=v->out;    // last output sample from this voice
+    v->out=samp[3];
+    unsigned vol;
+
+// switch volume to aeg output
+// scale by left and right amplitudes to get overall left and right multipliers
+#define SWVOL0(sw) \
+  if (sw) v->vol=v->egv[0].out; \
+  vol=v->vol; \
+  amp[0]=vol*v->lvol>>16; \
+  amp[1]=vol*v->rvol>>16
+
+    // immediate zero-crossing?
+    if(out!=0&&(out^samp[0])<0) {
+      SWVOL0(1);                  // switch volume
+      goto waz0r;                 // drop into code below to process all four samples
+      }
+    // otherwise start at amplitude stored in vol, possibly switch later to aeg output if a zero-crossing is found
+    SWVOL0(0);                    // update without switch
+    // look for zero crossing within four samples
+    if((samp[0]^samp[1])<0) {
+      tbuf[0][0]+=amp[0]*samp[0]; // process one sample
+      tbuf[0][1]+=amp[1]*samp[0];
+      SWVOL0(1);                  // switch volume
+      tbuf[1][0]+=amp[0]*samp[1]; // process one more sample
+      tbuf[1][1]+=amp[1]*samp[1];
+      goto waz2r;                 // drop into code below to process remaining two samples
+      }
+    if((samp[1]^samp[2])<0) {
+      tbuf[0][0]+=amp[0]*samp[0]; // process two samples
+      tbuf[0][1]+=amp[1]*samp[0];
+      tbuf[1][0]+=amp[0]*samp[1];
+      tbuf[1][1]+=amp[1]*samp[1];
+      SWVOL0(1);                  // switch volume
+      goto waz2r;                 // drop into code below to process remaining two samples
+      }
+    if((samp[2]^samp[3])<0) {
+      tbuf[0][0]+=amp[0]*samp[0]; // process two samples
+      tbuf[0][1]+=amp[1]*samp[0];
+      tbuf[1][0]+=amp[0]*samp[1];
+      tbuf[1][1]+=amp[1]*samp[1];
+      tbuf[2][0]+=amp[0]*samp[2]; // process one sample
+      tbuf[2][1]+=amp[1]*samp[2];
+      SWVOL0(1);                  // switch volume
+      tbuf[3][0]+=amp[0]*samp[3]; // process one more sample
+      tbuf[3][1]+=amp[1]*samp[3];
+      goto waz4r;                 // drop into code below to process next voice
+      }
+
+    // no zero-crossings within four samples
+    // accumulate 4 scaled samples into output buffer
+waz0r:
+    tbuf[0][0]+=amp[0]*samp[0];   // accumulate 2 scaled samples into output buffer
+    tbuf[0][1]+=amp[1]*samp[0];
+    tbuf[1][0]+=amp[0]*samp[1];
+    tbuf[1][1]+=amp[1]*samp[1];
+waz2r:
+    tbuf[2][0]+=amp[0]*samp[2];   // accumulate 2 scaled samples into output buffer
+    tbuf[2][1]+=amp[1]*samp[2];
+    tbuf[3][0]+=amp[0]*samp[3];
+    tbuf[3][1]+=amp[1]*samp[3];
+waz4r:
+    ;
+    }
   }
